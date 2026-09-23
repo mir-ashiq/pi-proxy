@@ -103,40 +103,94 @@ export function anthropicError(
   );
 }
 
-/** Build upstream fetch headers for a given provider + format. */
+/**
+ * Build upstream fetch headers for a given provider + format.
+ *
+ * Forwards the client's headers (so that any headers the SDK/pi sends
+ * that the upstream might require — User-Agent, Accept-Language,
+ * X-Stainless-*, anthropic-beta, etc. — get through), then OVERRIDES
+ * the auth headers with the provider's resolved API key.
+ *
+ * Headers that are always set by the proxy (not forwarded):
+ *   - Authorization / x-api-key  (provider's key)
+ *   - Content-Type               (always JSON)
+ *   - Cookie                     (provider's cookie, if any)
+ *
+ * Headers that ARE forwarded from the client:
+ *   - User-Agent, Accept, Accept-Language, Accept-Encoding
+ *   - anthropic-version, anthropic-beta
+ *   - X-Stainless-* (OpenAI SDK telemetry)
+ *   - Any other custom headers the client sends
+ */
 function buildUpstreamHeaders(
   provider: PiProvider,
   format: WireFormat,
-  extra?: HeadersInit,
+  clientHeaders: Headers,
 ): Headers {
-  const h = new Headers({
-    "Content-Type": "application/json",
-    Accept: "application/json, text/event-stream",
-    "User-Agent": `pi-proxy/${PI_PROXY_VERSION}`,
-    ...(extra ? Object.fromEntries(new Headers(extra).entries()) : {}),
-  });
+  // Start by copying ALL of the client's headers.
+  const h = new Headers(clientHeaders);
+
+  // Force JSON content type.
+  h.set("Content-Type", "application/json");
+  h.set("Accept", "application/json, text/event-stream");
+
+  // Remove client-side auth headers — we replace them with the
+  // provider's key so the client never needs to know the real key.
+  h.delete("authorization");
+  h.delete("x-api-key");
+  h.delete("api-key");
+  // Remove proxy-internal headers that shouldn't leak upstream.
+  h.delete("x-pi-demo");
+  h.delete("host");
+  h.delete("content-length"); // fetch will recompute this
+
+  // Set the provider's auth header based on the upstream's wire format.
   if (format === "anthropic") {
     h.set("x-api-key", provider.apiKey);
-    h.set("anthropic-version", "2023-06-01");
+    // Ensure anthropic-version is present (use client's if they sent one).
+    if (!h.has("anthropic-version")) {
+      h.set("anthropic-version", "2023-06-01");
+    }
   } else {
     h.set("Authorization", `Bearer ${provider.apiKey}`);
   }
-  if (provider.cookie) h.set("Cookie", provider.cookie);
+
+  // Override cookie with the provider's cookie if configured.
+  if (provider.cookie) {
+    h.set("Cookie", provider.cookie);
+  }
+
   return h;
 }
 
-/** Build the upstream URL for a given provider + format. */
-function buildUpstreamUrl(provider: PiProvider, format: WireFormat): string {
+/** Build the upstream URL for a given provider + format.
+ *
+ * Preserves query parameters from the client's request URL (e.g.
+ * `?beta=true` that pi sends on Anthropic-format requests).
+ */
+function buildUpstreamUrl(
+  provider: PiProvider,
+  format: WireFormat,
+  clientUrl?: URL,
+): string {
   const base = provider.baseUrl.replace(/\/+$/, "");
+  let path: string;
   if (format === "openai") {
     // OpenAI upstreams expect POST {base}/chat/completions
     // If baseUrl already ends with /v1, we just append /chat/completions.
-    if (base.endsWith("/v1")) return `${base}/chat/completions`;
-    return `${base}/v1/chat/completions`;
+    path = base.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
+  } else {
+    // Anthropic upstreams expect POST {base}/v1/messages
+    path = base.endsWith("/v1") ? "/messages" : "/v1/messages";
   }
-  // Anthropic upstreams expect POST {base}/v1/messages
-  if (base.endsWith("/v1")) return `${base}/messages`;
-  return `${base}/v1/messages`;
+
+  // Forward query params from the client's request (e.g. ?beta=true).
+  let query = "";
+  if (clientUrl && clientUrl.search) {
+    query = clientUrl.search; // already includes the leading "?"
+  }
+
+  return `${base}${path}${query}`;
 }
 
 /** Detect an Aliyun WAF challenge response (returns hint or null). */
@@ -238,8 +292,21 @@ export async function routeAndForward(
   // Convert request body if needed.
   const upstreamBody = convertRequestBody(body, conversion);
 
-  const url = buildUpstreamUrl(provider, providerFormat);
-  const headers = buildUpstreamHeaders(provider, providerFormat);
+  // Parse the client's URL to forward query params (e.g. ?beta=true).
+  const clientUrl = (() => {
+    try {
+      return new URL(req.url);
+    } catch {
+      return undefined;
+    }
+  })();
+
+  const url = buildUpstreamUrl(provider, providerFormat, clientUrl);
+  const headers = buildUpstreamHeaders(
+    provider,
+    providerFormat,
+    new Headers(req.headers),
+  );
 
   let upstream: Response;
   try {
@@ -294,14 +361,127 @@ export async function routeAndForward(
   }
 
   // Handle upstream HTTP errors.
+  //
+  // KEY DESIGN DECISION: the proxy is TRANSPARENT on errors. If the
+  // upstream returns a JSON error body (e.g.
+  //   {"error":{"message":"unauthorized client","type":"..."}}
+  // or
+  //   {"type":"error","error":{"type":"authentication_error","message":"..."}}
+  // ), the proxy forwards that JSON body AS-IS to the client, preserving
+  // the upstream's status code. This way the client sees the real error
+  // message from the upstream, not a double-wrapped proxy error.
+  //
+  // Only when the upstream returns a non-JSON body do we wrap it in our
+  // own error envelope.
   if (!upstream.ok) {
     const text = await upstream.text().catch(() => "");
+    const ct = upstream.headers.get("content-type") || "";
+
+    // Try to parse as JSON — if it succeeds, forward it verbatim.
+    let parsed: unknown = null;
+    if (text && (ct.includes("application/json") || text.trim().startsWith("{"))) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        // Not valid JSON — fall through to wrapping below.
+      }
+    }
+
+    if (parsed !== null) {
+      // Forward the upstream's JSON error body as-is, preserving status.
+      if (stream) {
+        // For streaming, emit the error as an SSE event in the client's
+        // expected format. If the upstream's error is already in the
+        // client's format (no conversion needed), forward verbatim.
+        // Otherwise wrap in the client's format.
+        let sseData: string;
+        if (conversion === "none") {
+          // Same format — forward the upstream's JSON error as-is.
+          sseData = text;
+        } else if (clientFormat === "openai") {
+          // Upstream is Anthropic, client wants OpenAI. Convert error.
+          const anthErr = parsed as { error?: { message?: string; type?: string } };
+          sseData = JSON.stringify({
+            error: {
+              message: anthErr?.error?.message || text,
+              type: anthErr?.error?.type || "upstream_error",
+              code: upstream.status,
+            },
+          });
+        } else {
+          // Upstream is OpenAI, client wants Anthropic. Convert error.
+          const oaiErr = parsed as { error?: { message?: string; type?: string } };
+          sseData = JSON.stringify({
+            type: "error",
+            error: {
+              type: oaiErr?.error?.type || "upstream_error",
+              message: oaiErr?.error?.message || text,
+            },
+          });
+        }
+        const sse = `data: ${sseData}\n\ndata: [DONE]\n\n`;
+        return {
+          response: new Response(sse, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
+            },
+          }),
+          conversion: "none",
+          provider,
+        };
+      }
+      // Non-streaming: forward the upstream's JSON error as-is.
+      // If conversion is needed, convert the error body.
+      let bodyToReturn = parsed;
+      if (conversion !== "none") {
+        // Extract the message from whichever format the upstream used,
+        // and re-wrap in the client's expected format.
+        const errMsg =
+          (parsed as { error?: { message?: string } })?.error?.message ||
+          text;
+        if (clientFormat === "openai") {
+          bodyToReturn = {
+            error: {
+              message: errMsg,
+              type: "upstream_error",
+              code: upstream.status,
+            },
+          };
+        } else {
+          bodyToReturn = {
+            type: "error",
+            error: {
+              type: "upstream_error",
+              message: errMsg,
+            },
+          };
+        }
+      }
+      return {
+        response: new Response(JSON.stringify(bodyToReturn), {
+          status: upstream.status,
+          headers: {
+            "Content-Type": "application/json",
+            "X-Pi-Proxy": PI_PROXY_VERSION,
+            "X-Pi-Proxy-Provider": provider.name,
+            "X-Pi-Proxy-Conversion": conversion,
+          },
+        }),
+        conversion: "none",
+        provider,
+      };
+    }
+
+    // Non-JSON error body — wrap in our own error envelope.
+    const fallbackMsg = text || `upstream returned ${upstream.status}`;
     if (stream) {
-      // Emit an SSE error event so streaming clients don't hang.
       if (clientFormat === "openai") {
         const errorBody = JSON.stringify({
           error: {
-            message: text || `upstream returned ${upstream.status}`,
+            message: fallbackMsg,
             type: "upstream_error",
             code: upstream.status,
           },
@@ -322,12 +502,11 @@ export async function routeAndForward(
           provider,
         };
       }
-      // Anthropic stream error.
       const errorPayload = JSON.stringify({
         type: "error",
         error: {
           type: "upstream_error",
-          message: text || `upstream returned ${upstream.status}`,
+          message: fallbackMsg,
         },
       });
       return {
@@ -346,16 +525,8 @@ export async function routeAndForward(
     return {
       response:
         clientFormat === "openai"
-          ? openAIError(
-              upstream.status,
-              text || `upstream returned ${upstream.status}`,
-              "upstream_error",
-            )
-          : anthropicError(
-              upstream.status,
-              text || `upstream returned ${upstream.status}`,
-              "upstream_error",
-            ),
+          ? openAIError(upstream.status, fallbackMsg, "upstream_error")
+          : anthropicError(upstream.status, fallbackMsg, "upstream_error"),
       conversion: "none",
       provider,
     };
