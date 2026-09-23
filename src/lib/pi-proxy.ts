@@ -402,15 +402,37 @@ export async function routeAndForward(
   //
   // Only when the upstream returns a non-JSON body do we wrap it in our
   // own error envelope.
+  //
+  // EDGE CASE: some upstreams return errors as SSE-formatted text
+  // (data: {error:...}\n\ndata: [DONE]\n\n) even when the client
+  // requested stream:false. We detect this and extract the JSON payload
+  // so non-streaming clients get a clean JSON error instead of a
+  // "network error" from trying to JSON.parse SSE text.
   if (!upstream.ok) {
     const text = await upstream.text().catch(() => "");
     const ct = upstream.headers.get("content-type") || "";
 
+    // If the body is SSE-formatted, extract the JSON payload from the
+    // first data: line. This handles upstreams that return errors as
+    // SSE even for non-streaming requests.
+    let textToParse = text;
+    if (
+      ct.includes("text/event-stream") ||
+      text.trim().startsWith("data:")
+    ) {
+      const dataLine = text
+        .split("\n")
+        .find((l) => l.trim().startsWith("data:"));
+      if (dataLine) {
+        textToParse = dataLine.replace(/^\s*data:\s*/, "").trim();
+      }
+    }
+
     // Try to parse as JSON — if it succeeds, forward it verbatim.
     let parsed: unknown = null;
-    if (text && (ct.includes("application/json") || text.trim().startsWith("{"))) {
+    if (textToParse && (ct.includes("application/json") || textToParse.trim().startsWith("{"))) {
       try {
-        parsed = JSON.parse(text);
+        parsed = JSON.parse(textToParse);
       } catch {
         // Not valid JSON — fall through to wrapping below.
       }
@@ -426,7 +448,9 @@ export async function routeAndForward(
         let sseData: string;
         if (conversion === "none") {
           // Same format — forward the upstream's JSON error as-is.
-          sseData = text;
+          // Use textToParse (the extracted JSON) not the raw text,
+          // in case the upstream returned SSE-framed errors.
+          sseData = textToParse;
         } else if (clientFormat === "openai") {
           // Upstream is Anthropic, client wants OpenAI. Convert error.
           const anthErr = parsed as { error?: { message?: string; type?: string } };
@@ -563,6 +587,39 @@ export async function routeAndForward(
 
   // Success: convert response if needed.
   if (stream) {
+    // EDGE CASE: if the upstream returned a non-streaming JSON response
+    // (Content-Type: application/json) even though the client requested
+    // stream:true, we can't pipe it through the SSE converter (which
+    // expects SSE-formatted input). Instead, read the JSON, convert it,
+    // and re-emit as a single SSE event followed by [DONE].
+    const upstreamCt = upstream.headers.get("content-type") || "";
+    if (upstreamCt.includes("application/json")) {
+      const jsonText = await upstream.text();
+      try {
+        const jsonBody = JSON.parse(jsonText);
+        const convertedBody = convertResponseBody(jsonBody, conversion);
+        // Emit as a single SSE chunk + [DONE].
+        const sseBody = `data: ${JSON.stringify(convertedBody)}\n\ndata: [DONE]\n\n`;
+        return {
+          response: new Response(sseBody, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
+              "X-Pi-Proxy": PI_PROXY_VERSION,
+              "X-Pi-Proxy-Provider": provider.name,
+              "X-Pi-Proxy-Conversion": conversion,
+            },
+          }),
+          conversion,
+          provider,
+        };
+      } catch {
+        // JSON parse failed — fall through to the normal streaming path
+        // (which will likely also fail, but at least we tried).
+      }
+    }
     // Streaming: wrap the upstream body with a format-converting TransformStream.
     const converted = convertStreamResponse(upstream, conversion, model);
     return { response: converted, conversion, provider };
@@ -570,9 +627,40 @@ export async function routeAndForward(
 
   // Non-streaming: read, convert, re-emit.
   const text = await upstream.text();
-  let parsed: unknown = text;
+
+  // EDGE CASE: some upstreams return SSE-formatted responses even when
+  // the client requested stream:false. If we detect SSE framing, extract
+  // the JSON payload from the data: lines so we can parse it as a normal
+  // JSON response.
+  const upstreamCt = upstream.headers.get("content-type") || "";
+  let textToParse = text;
+  if (
+    upstreamCt.includes("text/event-stream") ||
+    text.trim().startsWith("data:")
+  ) {
+    // Collect all data: lines (excluding [DONE]) and concatenate.
+    const dataLines = text
+      .split("\n")
+      .filter((l) => l.trim().startsWith("data:"))
+      .map((l) => l.replace(/^\s*data:\s*/, "").trim())
+      .filter((l) => l && l !== "[DONE]");
+    if (dataLines.length > 0) {
+      // If there are multiple chunks, try to reconstruct the full
+      // response by concatenating the content. This is a best-effort
+      // fallback for misbehaving upstreams.
+      if (dataLines.length === 1) {
+        textToParse = dataLines[0];
+      } else {
+        // Multiple SSE chunks — try parsing the first one as it often
+        // contains the complete response for error cases.
+        textToParse = dataLines[0];
+      }
+    }
+  }
+
+  let parsed: unknown = textToParse;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(textToParse);
   } catch {
     // Non-JSON response — surface as error.
     return {
