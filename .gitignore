@@ -67,3 +67,6 @@ server.log
 /tests/
 .bash_history
 .pi/
+# Pricing page artifacts (fetched during development)
+/pricing.json
+/pricing_text.txt
