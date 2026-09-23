@@ -40,6 +40,7 @@ import {
   convertResponseBody,
   convertStreamResponse,
 } from "@/lib/format-converter";
+import { platform as osPlatform, release as osRelease, arch as osArch } from "node:os";
 
 export const PI_PROXY_VERSION = "2.0.0";
 
@@ -104,22 +105,45 @@ export function anthropicError(
 }
 
 /**
+ * Build a Pi-style User-Agent string that matches what the Pi CLI
+ * itself sends when calling upstreams.
+ *
+ * Pi's getPiUserAgent() returns:
+ *   `pi (<platform> <release>; <arch>)`
+ * e.g. `pi (linux 6.5.0; x64)`
+ *
+ * AgentRouter (and possibly other providers) whitelist the `pi (...)`
+ * User-Agent prefix. If the proxy sends a generic User-Agent (curl/x.x,
+ * node-fetch/x.x, etc.) the upstream rejects with "unauthorized client".
+ *
+ * We replicate Pi's User-Agent so the proxy looks like a legitimate Pi
+ * client to the upstream.
+ */
+function buildPiUserAgent(): string {
+  const platformStr = osPlatform() || (process.platform || "linux");
+  const releaseStr = osRelease() || "";
+  const archStr = osArch() || (process.arch || "x64");
+  return `pi (${platformStr} ${releaseStr}; ${archStr})`;
+}
+
+/**
  * Build upstream fetch headers for a given provider + format.
  *
  * Forwards the client's headers (so that any headers the SDK/pi sends
- * that the upstream might require — User-Agent, Accept-Language,
- * X-Stainless-*, anthropic-beta, etc. — get through), then OVERRIDES
- * the auth headers with the provider's resolved API key.
+ * that the upstream might require — X-Stainless-*, anthropic-beta, etc.
+ * — get through), then OVERRIDES the auth headers with the provider's
+ * resolved API key and the User-Agent with Pi's User-Agent.
  *
  * Headers that are always set by the proxy (not forwarded):
  *   - Authorization / x-api-key  (provider's key)
  *   - Content-Type               (always JSON)
+ *   - User-Agent                 (Pi-style, to pass client fingerprinting)
  *   - Cookie                     (provider's cookie, if any)
  *
  * Headers that ARE forwarded from the client:
- *   - User-Agent, Accept, Accept-Language, Accept-Encoding
- *   - anthropic-version, anthropic-beta
  *   - X-Stainless-* (OpenAI SDK telemetry)
+ *   - anthropic-version, anthropic-beta
+ *   - Accept, Accept-Language, Accept-Encoding
  *   - Any other custom headers the client sends
  */
 function buildUpstreamHeaders(
@@ -154,6 +178,11 @@ function buildUpstreamHeaders(
   } else {
     h.set("Authorization", `Bearer ${provider.apiKey}`);
   }
+
+  // Override User-Agent with Pi's User-Agent so the upstream sees a
+  // legitimate Pi client. This is critical for AgentRouter and any
+  // other provider that does client fingerprinting on User-Agent.
+  h.set("User-Agent", buildPiUserAgent());
 
   // Override cookie with the provider's cookie if configured.
   if (provider.cookie) {

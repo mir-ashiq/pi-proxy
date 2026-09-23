@@ -72,6 +72,7 @@ export async function GET(req: NextRequest) {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
+    "User-Agent": "pi (<platform> <release>; <arch>)  ← Pi-style UA, see note",
   };
   if (providerFormat === "anthropic") {
     headers["x-api-key"] = maskApiKey(provider.apiKey);
@@ -96,7 +97,7 @@ export async function GET(req: NextRequest) {
       upstream_method: "POST",
     },
     headers_sent_to_upstream: headers,
-    note: "Client headers (User-Agent, X-Stainless-*, anthropic-beta, etc.) are also forwarded. Only auth headers are replaced with the provider's key.",
+    note: "The proxy sets User-Agent to 'pi (<platform> <release>; <arch>)' to match what the Pi CLI sends — this is required because AgentRouter does client fingerprinting on User-Agent and rejects non-Pi clients with 'unauthorized client'. Client headers (X-Stainless-*, anthropic-beta, etc.) are also forwarded. Only auth headers are replaced with the provider's key.",
     config_source: cfg.source,
     config_error: cfg.error || null,
     version: PI_PROXY_VERSION,
