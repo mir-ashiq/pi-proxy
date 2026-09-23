@@ -1,12 +1,11 @@
 import { NextRequest } from "next/server";
+import { PI_PROXY_VERSION } from "@/lib/pi-proxy";
 import {
-  MODEL_CATALOG,
-  UPSTREAM_OPENAI_BASE,
-  joinUrl,
-  openaiUpstreamHeaders,
-  resolveApiKey,
-  PI_PROXY_VERSION,
-} from "@/lib/pi-proxy";
+  apiFormatToWireFormat,
+  getAllModels,
+  loadPiConfig,
+  maskApiKey,
+} from "@/lib/pi-config";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,98 +13,62 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/v1/models
  *
- * OpenAI-compatible model listing endpoint. Tries to proxy the upstream
- * AgentRouter `/v1/models` call; if that fails for any reason, falls back
- * to the static MODEL_CATALOG so the client always gets a usable list.
+ * Returns an OpenAI-style model list built from ALL providers configured
+ * in ~/.pi/agent/models.json. Each model entry includes a `providers`
+ * array showing which upstream providers serve it and in which wire format,
+ * so clients can see what's available.
+ *
+ * Accepts an optional `?format=openai|anthropic` query param to filter
+ * models to those served by at least one provider in that format.
  */
 export async function GET(req: NextRequest) {
-  const apiKey = resolveApiKey(req);
+  const cfg = loadPiConfig();
+  const allModels = getAllModels();
 
-  let upstreamData: unknown = null;
-  let upstreamError: string | null = null;
+  const formatFilter = req.nextUrl.searchParams.get("format");
+  const models =
+    formatFilter === "openai" || formatFilter === "anthropic"
+      ? allModels.filter((m) =>
+          m.providers.some((p) => p.format === formatFilter),
+        )
+      : allModels;
 
-  try {
-    const upstream = await fetch(joinUrl(UPSTREAM_OPENAI_BASE, "/models"), {
-      method: "GET",
-      headers: openaiUpstreamHeaders(apiKey),
-      // Don't hang the whole route on a slow upstream.
-      signal: AbortSignal.timeout(8_000),
-    });
-
-    if (upstream.ok) {
-      const text = await upstream.text();
-      try {
-        upstreamData = JSON.parse(text);
-      } catch {
-        upstreamError = `upstream returned non-JSON body (len=${text.length})`;
-      }
-    } else {
-      upstreamError = `upstream ${upstream.status}: ${await upstream.text().catch(() => "")}`;
-    }
-  } catch (e) {
-    upstreamError = e instanceof Error ? e.message : String(e);
-  }
-
-  // Static catalog, decorated to look like OpenAI model objects.
-  const fallback = MODEL_CATALOG.map((m) => ({
+  const data = models.map((m) => ({
     id: m.id,
     object: "model" as const,
     created: 1_700_000_000,
-    owned_by: m.vendor.toLowerCase().replace(/\s+/g, "-"),
-    vendor: m.vendor,
-    formats: m.formats,
+    owned_by: m.providers[0]?.name || "unknown",
+    name: m.name,
+    providers: m.providers.map((p) => ({
+      name: p.name,
+      format: p.format,
+    })),
+    // Convenience: which wire formats this model supports across all providers.
+    formats: m.providers.map((p) => p.format),
   }));
 
-  if (upstreamData && typeof upstreamData === "object") {
-    const upstreamList =
-      (upstreamData as { data?: unknown[] }).data ?? [];
-    const seen = new Set<string>();
-    const merged: unknown[] = [];
-    for (const m of upstreamList as Array<Record<string, unknown>>) {
-      const id = typeof m?.id === "string" ? m.id : null;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      merged.push(m);
-    }
-    for (const m of fallback) {
-      if (!seen.has(m.id)) {
-        seen.add(m.id);
-        merged.push(m);
-      }
-    }
-    return Response.json(
-      {
-        object: "list",
-        data: merged,
-        _pi_proxy: {
-          version: PI_PROXY_VERSION,
-          source: "upstream+catalog",
-        },
-      },
-      {
-        headers: {
-          "X-Pi-Proxy": PI_PROXY_VERSION,
-          "Cache-Control": "no-store",
-        },
-      },
-    );
-  }
-
-  // Upstream failed — return only the static catalog, with the error
-  // surfaced in a non-breaking `_pi_proxy` envelope so the client can
-  // decide whether to display a warning.
   return Response.json(
     {
       object: "list",
-      data: fallback,
+      data,
       _pi_proxy: {
         version: PI_PROXY_VERSION,
-        source: "catalog-fallback",
-        upstream_error: upstreamError,
+        config_source: cfg.source,
+        config_error: cfg.error || null,
+        providers_total: cfg.providers.length,
+        providers: cfg.providers.map((p) => ({
+          name: p.name,
+          baseUrl: p.baseUrl,
+          api: p.api,
+          format: apiFormatToWireFormat(p.api),
+          apiKey_preview: maskApiKey(p.apiKey),
+          apiKey_configured: Boolean(p.apiKey),
+          models_count: p.models.length,
+          has_cookie: Boolean(p.cookie),
+        })),
       },
     },
     {
-      status: 200,
       headers: {
         "X-Pi-Proxy": PI_PROXY_VERSION,
         "Cache-Control": "no-store",

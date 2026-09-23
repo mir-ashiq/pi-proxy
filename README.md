@@ -1,8 +1,21 @@
 # π Pi Proxy Server
 
-A Pi-compatible proxy server that bridges **OpenAI Chat Completions** and **Anthropic Messages** wire formats to the [AgentRouter](https://agentrouter.org/docs/pi.html) upstream.
+A **config-driven AI gateway** that reads your [Pi CLI](https://pi.dev) config (`~/.pi/agent/models.json`) and exposes every configured provider as a unified OpenAI + Anthropic compatible API.
 
-One server, both wire formats, full streaming support. Drop-in compatible with the OpenAI SDK, the Anthropic SDK, and the [Pi CLI coding agent](https://pi.dev).
+## Architecture
+
+```
+┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+│  1. Pi config       │     │  2. Pi Proxy        │     │  3. Your providers  │
+│  ~/.pi/agent/       │ ──▶ │  /api/v1/*          │ ──▶ │  OpenAI · Anthropic │
+│  models.json        │     │  routes by model    │     │  AgentRouter · …    │
+│                     │     │  converts formats   │     │                     │
+│  (your providers,  │     │  (openai↔anthropic) │     │  (real upstreams,   │
+│   keys, formats)    │     │                     │     │   your keys)        │
+└─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+```
+
+**You configure providers once in Pi's `models.json`** — any baseUrl, any apiKey, any wire format. The proxy reads that config and routes each incoming request to the matching provider based on the requested model. If the client's format differs from the provider's, the proxy converts on the fly (OpenAI ↔ Anthropic, including streaming SSE).
 
 ## Endpoints
 
@@ -10,138 +23,147 @@ One server, both wire formats, full streaming support. Drop-in compatible with t
 |--------|------|--------|-------------|
 | `POST` | `/api/v1/chat/completions` | OpenAI | Chat completions (streaming + non-streaming) |
 | `POST` | `/api/v1/messages` | Anthropic | Messages (streaming + non-streaming) |
-| `GET`  | `/api/v1/models` | OpenAI | Model listing |
+| `GET`  | `/api/v1/models` | OpenAI | All models from all configured providers |
 | `GET`  | `/api/health` | — | Liveness probe |
-| `GET`  | `/api/config` | — | Public config introspection |
+| `GET`  | `/api/config` | — | Loaded providers + routing table (masked keys) |
 
 ## Quick start
 
-### 1. Configure environment
+### 1. Configure your providers in Pi
 
-```bash
-cp .env.example .env
-# Edit .env and set PI_GATEWAY_API_KEY
-```
-
-### 2. Install & run
-
-```bash
-bun install
-bun run dev
-```
-
-The proxy is now live at `http://localhost:3000`.
-
-### 3. Use with OpenAI SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:3000/api/v1",
-    api_key="sk-test",  # any non-empty string — the proxy injects the real key
-)
-
-resp = client.chat.completions.create(
-    model="deepseek-v4-flash",
-    messages=[{"role": "user", "content": "Say hi in 5 words."}],
-)
-print(resp.choices[0].message.content)
-```
-
-### 4. Use with Anthropic SDK
-
-```python
-from anthropic import Anthropic
-
-client = Anthropic(
-    base_url="http://localhost:3000/api",
-    api_key="sk-test",  # any non-empty string — the proxy injects the real key
-)
-
-msg = client.messages.create(
-    model="claude-opus-4-8",
-    max_tokens=512,
-    messages=[{"role": "user", "content": "Say hi in 5 words."}],
-)
-print(msg.content[0].text)
-```
-
-### 5. Use with Pi CLI
-
-Drop this into `~/.pi/agent/models.json`:
+Edit `~/.pi/agent/models.json`:
 
 ```json
 {
   "providers": {
-    "AgentRouter-Pi-OpenAI": {
-      "baseUrl": "http://localhost:3000/api/v1",
+    "My-OpenAI": {
+      "baseUrl": "https://api.openai.com/v1",
       "api": "openai-completions",
-      "apiKey": "$PI_GATEWAY_API_KEY",
+      "apiKey": "$OPENAI_API_KEY",
       "models": [
-        { "id": "deepseek-v4-flash", "name": "deepseek-v4-flash" },
-        { "id": "glm-5.3", "name": "glm-5.3" },
-        { "id": "gpt-5.6-sol", "name": "gpt-5.6-sol" },
-        { "id": "gpt-6-astra", "name": "gpt-6-astra" }
+        { "id": "gpt-4", "name": "gpt-4" },
+        { "id": "gpt-4o", "name": "gpt-4o" }
       ]
     },
-    "AgentRouter-Pi-Anthropic": {
-      "baseUrl": "http://localhost:3000/api",
+    "My-Anthropic": {
+      "baseUrl": "https://api.anthropic.com",
       "api": "anthropic-messages",
-      "apiKey": "$PI_GATEWAY_API_KEY",
+      "apiKey": "$ANTHROPIC_API_KEY",
       "models": [
-        { "id": "claude-opus-5", "name": "claude-opus-5" },
-        { "id": "claude-opus-4-8", "name": "claude-opus-4-8" },
-        { "id": "glm-5.3", "name": "glm-5.3" },
-        { "id": "deepseek-v4-flash", "name": "deepseek-v4-flash" }
+        { "id": "claude-opus-4-1", "name": "claude-opus-4-1" },
+        { "id": "claude-sonnet-4", "name": "claude-sonnet-4" }
       ]
     }
   }
 }
 ```
 
-Then:
+The `apiKey` field accepts either a literal string or `$ENV_VAR_NAME` (Pi's convention — the proxy resolves it from the environment).
+
+### 2. Set your API keys in the environment
 
 ```bash
-export PI_GATEWAY_API_KEY="your-agentrouter-key"
-pi --print --no-tools --provider AgentRouter-Pi-OpenAI --model deepseek-v4-flash "Hello!"
+export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-## How it works
+### 3. Install & run the proxy
 
-1. **Client sends request** — An OpenAI or Anthropic SDK POSTs to the proxy.
-2. **Proxy forwards upstream** — Swaps in the AgentRouter API key (or honors a client-supplied one), sets the right headers, forwards to `agentrouter.org`.
-3. **Stream flows back** — The SSE response is piped back byte-for-byte, so token streaming, tool calls, and stop reasons all survive intact.
+```bash
+bun install
+bun run dev
+```
+
+The proxy is now live at `http://localhost:3000`. It reads your Pi config on startup (and re-reads every 5 seconds, so config changes are picked up live).
+
+### 4. Use with any OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:3000/api/v1",
+    api_key="any-string",  # proxy uses keys from your Pi config
+)
+
+# This routes to "My-OpenAI" (no conversion needed)
+resp = client.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "Say hi"}],
+)
+
+# This routes to "My-Anthropic" (proxy converts openai→anthropic on the fly)
+resp = client.chat.completions.create(
+    model="claude-opus-4-1",
+    messages=[{"role": "user", "content": "Say hi"}],
+)
+```
+
+### 5. Use with any Anthropic SDK
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:3000/api",
+    api_key="any-string",
+)
+
+# Routes to "My-Anthropic" (no conversion)
+msg = client.messages.create(
+    model="claude-opus-4-1",
+    max_tokens=512,
+    messages=[{"role": "user", "content": "Say hi"}],
+)
+
+# Routes to "My-OpenAI" (proxy converts anthropic→openai)
+msg = client.messages.create(
+    model="gpt-4",
+    max_tokens=512,
+    messages=[{"role": "user", "content": "Say hi"}],
+)
+```
+
+### 6. Use with Pi CLI
+
+Pi and the proxy share the same config file, so once your providers are in `~/.pi/agent/models.json`, both work:
+
+```bash
+pi --print --no-tools --provider My-OpenAI --model gpt-4 "Hello!"
+```
+
+## How routing works
+
+When a request arrives with `model: "X"`:
+
+1. The proxy looks up `X` across all providers in your Pi config.
+2. If multiple providers serve `X`, it prefers one whose wire format matches the client's request (to avoid conversion).
+3. If no same-format provider exists, it picks the first match and converts the request/response on the fly.
+4. The request is forwarded to that provider's `baseUrl` with that provider's resolved `apiKey`.
+
+Format conversions supported:
+- **Request body**: OpenAI system messages → Anthropic `system` field (and back)
+- **Non-streaming response**: `choices[0].message.content` ↔ `content[].text`
+- **Streaming SSE**: `data: {choices:[{delta:{content}}]}` ↔ `event: content_block_delta`
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_GATEWAY_API_KEY` | (none) | AgentRouter API key, forwarded to the upstream |
-| `PI_UPSTREAM_OPENAI` | `https://agentrouter.org/v1` | OpenAI-format upstream base URL |
-| `PI_UPSTREAM_ANTHROPIC` | `https://agentrouter.org` | Anthropic-format upstream base URL |
-| `PI_UPSTREAM_COOKIE` | (none) | Optional cookie string forwarded to upstream (for WAF bypass) |
-| `PI_DEMO_MODE` | `0` | When `1`, returns simulated SSE responses without hitting upstream |
+| `PI_CONFIG_PATH` | `~/.pi/agent/models.json` | Path to Pi's models.json |
+| `PI_DEMO_MODE` | `0` | When `1`, returns simulated SSE responses without hitting upstreams |
+| `PI_UPSTREAM_COOKIE_<ProviderName>` | (none) | Optional cookie forwarded to a specific provider (for WAF bypass) |
 
-## Notes on the AgentRouter WAF
-
-AgentRouter sits behind an Aliyun WAF that may issue a slider captcha to non-browser clients depending on source IP/region. The proxy detects this and returns a clean `502 WAF_CHALLENGE` error with fix instructions.
-
-If you hit this:
-
-1. Open `https://agentrouter.org` in a browser.
-2. Solve the slider captcha once.
-3. Copy the `acw_tc` cookie (and any session cookies) from dev tools → Application → Cookies.
-4. Set `PI_UPSTREAM_COOKIE="acw_tc=...; other=..."` in `.env`.
+API keys are **not** set via env vars on the proxy directly — they come from the `apiKey` field in each provider's config (which itself can reference `$ENV_VAR`).
 
 ## Demo mode
 
-For verifying the proxy plumbing without a reachable upstream, enable **Demo mode**:
+For verifying the proxy plumbing without reachable upstreams:
 
 - Globally: `PI_DEMO_MODE=1` in `.env`
 - Per-request: `x-pi-demo: 1` header
 
-Demo mode returns well-formed simulated OpenAI/Anthropic SSE streams.
+Returns well-formed simulated OpenAI/Anthropic SSE streams.
 
 ## Tech stack
 
