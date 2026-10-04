@@ -1,4 +1,6 @@
 // Test if Node's native fetch (which Pi uses) gets through the WAF.
+
+export {}; // make this file a module (top-level await)
 const API_KEY = process.env.PI_GATEWAY_API_KEY || "";
 if (!API_KEY) {
   console.error("Set PI_GATEWAY_API_KEY in your environment before running this script.");

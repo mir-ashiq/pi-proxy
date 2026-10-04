@@ -214,6 +214,20 @@ provider at the Anthropic endpoint lets the proxy convert and pad end-to-end.
 
 API keys are **not** set via env vars on the proxy directly — they come from the `apiKey` field in each provider's config (which itself can reference `$ENV_VAR`).
 
+## Client-side API keys (v2.1.1)
+
+The proxy prefers **the key the client presents** over the server-side
+provider key. A request carrying `Authorization: Bearer <k>`, `x-api-key: <k>`,
+or `api-key: <k>` forwards that exact key upstream (remapped to the header
+shape the upstream's wire format expects). Keyless clients fall back to the
+provider's `apiKey` from models.json.
+
+This means key rotation happens **where the client is configured** — e.g.
+LEGION's `settings.yaml` or a CLI env var — with no edits on the proxy VPS.
+Every provider-routed response carries `X-Pi-Proxy-Key-Source: client|server`
+so you can verify which key reached the upstream. Auth schemes that are not
+API keys (`Basic`, `Digest`, a bare `Bearer`, …) are never forwarded.
+
 ## Demo mode
 
 For verifying the proxy plumbing without reachable upstreams:
@@ -229,9 +243,11 @@ Every proxied response carries `X-Pi-Proxy` headers:
 
 - `X-Pi-Proxy` — proxy version
 - `X-Pi-Proxy-Provider` — provider that served the request
-- `X-Pi-Proxy-Conversion` — `none` / `openai→anthropic` / `anthropic→openai`
+- `X-Pi-Proxy-Conversion` — `none` / `openai->anthropic` / `anthropic->openai`
 - `X-Pi-Proxy-Think-Pad` — `dialect` / `forced` / `off` plus how many turns
   were padded (e.g. `dialect;padded=3`)
+- `X-Pi-Proxy-Key-Source` — `client` / `server`: which API key reached the
+  upstream (the client's own header, or the provider's server-side key)
 
 `GET /api/config` also reports the per-provider padding mode and the learned
 list of thinking-producing models; `GET /api/debug?model=X&format=openai`

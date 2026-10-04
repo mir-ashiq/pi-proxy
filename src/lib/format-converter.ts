@@ -1572,15 +1572,23 @@ export function reconstructAnthropicResponseFromSSE(text: string): unknown | nul
 /* ------------------------------------------------------------------ */
 
 /**
+ * The conversion label. NOTE: ASCII `->` only — this string rides the
+ * `X-Pi-Proxy-Conversion` response header, and Node's Headers rejects
+ * non-ASCII header values (the `→` form crashed every converted response
+ * with `TypeError: Header ... has invalid value`).
+ */
+export type Conversion = "none" | "openai->anthropic" | "anthropic->openai";
+
+/**
  * Decide whether conversion is needed between the client's request
  * format and the upstream provider's wire format.
  */
 export function conversionNeeded(
   clientFormat: WireFormat,
   providerFormat: WireFormat,
-): "none" | "openai→anthropic" | "anthropic→openai" {
+): Conversion {
   if (clientFormat === providerFormat) return "none";
-  return clientFormat === "openai" ? "openai→anthropic" : "anthropic→openai";
+  return clientFormat === "openai" ? "openai->anthropic" : "anthropic->openai";
 }
 
 /**
@@ -1588,10 +1596,10 @@ export function conversionNeeded(
  */
 export function convertRequestBody(
   body: unknown,
-  conversion: "none" | "openai→anthropic" | "anthropic→openai",
+  conversion: Conversion,
 ): unknown {
   if (conversion === "none") return body;
-  if (conversion === "openai→anthropic") {
+  if (conversion === "openai->anthropic") {
     return openAIRequestToAnthropic(body as OpenAIRequestBody);
   }
   return anthropicRequestToOpenAI(body as AnthropicRequestBody);
@@ -1602,10 +1610,10 @@ export function convertRequestBody(
  */
 export function convertResponseBody(
   body: unknown,
-  conversion: "none" | "openai→anthropic" | "anthropic→openai",
+  conversion: Conversion,
 ): unknown {
   if (conversion === "none") return body;
-  if (conversion === "openai→anthropic") {
+  if (conversion === "openai->anthropic") {
     return openAIResponseToAnthropic(body as OpenAIResponse);
   }
   return anthropicResponseToOpenAI(body as AnthropicResponse);
@@ -1618,12 +1626,12 @@ export function convertResponseBody(
  */
 export function convertStreamResponse(
   upstream: Response,
-  conversion: "none" | "openai→anthropic" | "anthropic→openai",
+  conversion: Conversion,
   model: string,
   options?: StreamConvertOptions,
 ): Response {
   if (conversion === "none") return upstream;
-  if (conversion === "openai→anthropic") {
+  if (conversion === "openai->anthropic") {
     return openAIStreamToAnthropicStream(upstream, model, options);
   }
   return anthropicStreamToOpenAIStream(upstream, model, options);

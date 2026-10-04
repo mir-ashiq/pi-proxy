@@ -36,6 +36,7 @@ import {
   maskApiKey,
 } from "@/lib/pi-config";
 import {
+  type Conversion,
   conversionNeeded,
   convertRequestBody,
   convertResponseBody,
@@ -54,7 +55,7 @@ import {
 } from "@/lib/thinking";
 import { platform as osPlatform, release as osRelease, arch as osArch } from "node:os";
 
-export const PI_PROXY_VERSION = "2.1.0";
+export const PI_PROXY_VERSION = "2.1.1";
 
 /** Demo mode: when true, return simulated responses without hitting upstreams. */
 export const DEMO_MODE =
@@ -150,15 +151,52 @@ function buildPiUserAgent(): string {
 }
 
 /**
+ * Extract the API key the CLIENT presented — `Authorization: Bearer <k>`,
+ * `x-api-key: <k>`, or `api-key: <k>` (checked in that priority).
+ * Returns "" when the client sent no usable key.
+ *
+ * v2.1.1: the client's key WINS over the server-configured provider key.
+ * Operators configure the key where the client lives (LEGION's
+ * settings.yaml, a CLI env var, ...) and the proxy forwards it verbatim —
+ * rotating a key no longer means editing models.json on the proxy VPS.
+ * Keyless clients (curl smoketests, demos) keep riding the server-side
+ * provider key as fallback.
+ */
+export function extractClientApiKey(clientHeaders: Headers): string {
+  const xKey = clientHeaders.get("x-api-key")?.trim();
+  if (xKey) return xKey;
+  const altKey = clientHeaders.get("api-key")?.trim();
+  if (altKey) return altKey;
+  const auth = clientHeaders.get("authorization")?.trim();
+  if (auth) {
+    const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+    if (bearer?.[1]?.trim()) return bearer[1].trim();
+    // Other auth schemes (Basic/Digest/NTLM/... — with or without their
+    // credential) are NOT API keys; a bare "Bearer" with a blank token
+    // isn't either. Never forward those as the upstream key.
+    if (AUTH_SCHEME_RE.test(auth)) return "";
+    // A raw key without the Bearer prefix — accept it too.
+    return auth;
+  }
+  return "";
+}
+
+/** Auth schemes that must never be forwarded as an upstream API key. */
+const AUTH_SCHEME_RE =
+  /^(?:bearer|basic|digest|negotiate|ntlm|hoba|mutual|scram-sha-1|scram-sha-256)(?:\s|$)/i;
+
+/**
  * Build upstream fetch headers for a given provider + format.
  *
  * Forwards the client's headers (so that any headers the SDK/pi sends
  * that the upstream might require — X-Stainless-*, anthropic-beta, etc.
- * — get through), then OVERRIDES the auth headers with the provider's
- * resolved API key and the User-Agent with Pi's User-Agent.
+ * — get through), then OVERRIDES the auth headers with the resolved API
+ * key (the CLIENT's key when it presented one — v2.1.1 — else the
+ * provider's server-configured key) and the User-Agent with Pi's
+ * User-Agent.
  *
  * Headers that are always set by the proxy (not forwarded):
- *   - Authorization / x-api-key  (provider's key)
+ *   - Authorization / x-api-key  (resolved key: client-first, then server)
  *   - Content-Type               (always JSON)
  *   - User-Agent                 (Pi-style, to pass client fingerprinting)
  *   - Cookie                     (provider's cookie, if any)
@@ -168,12 +206,19 @@ function buildPiUserAgent(): string {
  *   - anthropic-version, anthropic-beta
  *   - Accept, Accept-Language, Accept-Encoding
  *   - Any other custom headers the client sends
+ *
+ * @returns the upstream headers plus which source the API key came from.
  */
-function buildUpstreamHeaders(
+export function buildUpstreamHeaders(
   provider: PiProvider,
   format: WireFormat,
   clientHeaders: Headers,
-): Headers {
+): { headers: Headers; keySource: "client" | "server" } {
+  // v2.1.1: capture the client's key BEFORE the auth headers are dropped.
+  const clientKey = extractClientApiKey(clientHeaders);
+  const apiKey = clientKey || provider.apiKey;
+  const keySource: "client" | "server" = clientKey ? "client" : "server";
+
   // Start by copying ALL of the client's headers.
   const h = new Headers(clientHeaders);
 
@@ -181,8 +226,8 @@ function buildUpstreamHeaders(
   h.set("Content-Type", "application/json");
   h.set("Accept", "application/json, text/event-stream");
 
-  // Remove client-side auth headers — we replace them with the
-  // provider's key so the client never needs to know the real key.
+  // Remove client-side auth headers — we replace them with the resolved
+  // key (client-first) so the client never needs to know the server key.
   h.delete("authorization");
   h.delete("x-api-key");
   h.delete("api-key");
@@ -194,15 +239,15 @@ function buildUpstreamHeaders(
   // explicitly configures one (below).
   h.delete("cookie");
 
-  // Set the provider's auth header based on the upstream's wire format.
+  // Set the resolved auth header based on the upstream's wire format.
   if (format === "anthropic") {
-    h.set("x-api-key", provider.apiKey);
+    h.set("x-api-key", apiKey);
     // Ensure anthropic-version is present (use client's if they sent one).
     if (!h.has("anthropic-version")) {
       h.set("anthropic-version", "2023-06-01");
     }
   } else {
-    h.set("Authorization", `Bearer ${provider.apiKey}`);
+    h.set("Authorization", `Bearer ${apiKey}`);
   }
 
   // Override User-Agent with Pi's User-Agent so the upstream sees a
@@ -215,7 +260,7 @@ function buildUpstreamHeaders(
     h.set("Cookie", provider.cookie);
   }
 
-  return h;
+  return { headers: h, keySource };
 }
 
 /** Build the upstream URL for a given provider + format.
@@ -278,7 +323,10 @@ export interface RouteResult {
   /** Provider used (for logging/headers). */
   provider?: PiProvider;
   /** Whether format conversion was applied. */
-  conversion: "none" | "openai→anthropic" | "anthropic→openai";
+  conversion: Conversion;
+  /** Where the upstream API key came from: the client's request headers
+   *  ("client") or the server-configured provider key ("server"). */
+  keySource?: "client" | "server";
 }
 
 /** Resolve the effective thinking-pad mode for a provider+model request. */
@@ -373,9 +421,28 @@ function observePassthroughStream(
  * `body` is the parsed request body. `req` is the original Request (for
  * demo-mode detection and header forwarding).
  *
- * Returns a RouteResult with the Response to return to the client.
+ * Returns a RouteResult with the Response to return to the client. Every
+ * provider-routed result carries the `X-Pi-Proxy-Key-Source` response
+ * header ("client" | "server") so operators can verify which API key
+ * reached the upstream — see {@link extractClientApiKey}.
  */
 export async function routeAndForward(
+  req: Request,
+  body: unknown,
+  clientFormat: WireFormat,
+): Promise<RouteResult> {
+  const result = await routeAndForwardInner(req, body, clientFormat);
+  if (result.provider !== undefined && result.keySource !== undefined) {
+    try {
+      result.response.headers.set("X-Pi-Proxy-Key-Source", result.keySource);
+    } catch {
+      // Headers already sent / immutable — observability only, skip.
+    }
+  }
+  return result;
+}
+
+async function routeAndForwardInner(
   req: Request,
   body: unknown,
   clientFormat: WireFormat,
@@ -448,7 +515,7 @@ export async function routeAndForward(
   })();
 
   const url = buildUpstreamUrl(provider, providerFormat, clientUrl);
-  const headers = buildUpstreamHeaders(
+  const { headers, keySource } = buildUpstreamHeaders(
     provider,
     providerFormat,
     new Headers(req.headers),
@@ -474,6 +541,7 @@ export async function routeAndForward(
           : anthropicError(502, `upstream fetch failed: ${msg}`, "upstream_error"),
       conversion: "none",
       provider,
+      keySource,
     };
   }
 
@@ -489,6 +557,7 @@ export async function routeAndForward(
             : anthropicError(502, waf, "upstream_waf_challenge"),
         conversion: "none",
         provider,
+        keySource,
       };
     }
     return {
@@ -506,6 +575,7 @@ export async function routeAndForward(
             ),
       conversion: "none",
       provider,
+      keySource,
     };
   }
 
@@ -604,6 +674,7 @@ export async function routeAndForward(
           }),
           conversion: "none",
           provider,
+          keySource,
         };
       }
       // Non-streaming: forward the upstream's JSON error as-is.
@@ -645,6 +716,7 @@ export async function routeAndForward(
         }),
         conversion: "none",
         provider,
+        keySource,
       };
     }
 
@@ -673,6 +745,7 @@ export async function routeAndForward(
           ),
           conversion: "none",
           provider,
+          keySource,
         };
       }
       const errorPayload = JSON.stringify({
@@ -693,6 +766,7 @@ export async function routeAndForward(
         }),
         conversion: "none",
         provider,
+        keySource,
       };
     }
     return {
@@ -702,6 +776,7 @@ export async function routeAndForward(
           : anthropicError(upstream.status, fallbackMsg, "upstream_error"),
       conversion: "none",
       provider,
+      keySource,
     };
   }
 
@@ -736,6 +811,7 @@ export async function routeAndForward(
           }),
           conversion,
           provider,
+          keySource,
         };
       } catch {
         // JSON parse failed — fall through to the normal streaming path
@@ -764,7 +840,7 @@ export async function routeAndForward(
     } catch {
       // Headers immutable on this response — observability only, skip.
     }
-    return { response: converted, conversion, provider };
+    return { response: converted, conversion, provider, keySource };
   }
 
   // Non-streaming: read, convert, re-emit.
@@ -805,6 +881,7 @@ export async function routeAndForward(
               ),
         conversion: "none",
         provider,
+        keySource,
       };
     }
   }
@@ -826,6 +903,7 @@ export async function routeAndForward(
     }),
     conversion,
     provider,
+    keySource,
   };
 }
 
