@@ -37,7 +37,11 @@ export type WireFormat = "openai" | "anthropic";
 export interface PiModelEntry {
   id: string;
   name?: string;
+  /** Optional override: does this model produce reasoning content? */
+  thinking?: boolean;
 }
+
+export type ThinkingPadMode = "auto" | "always" | "never";
 
 export interface PiProvider {
   /** Provider name (key in the `providers` object). */
@@ -54,6 +58,8 @@ export interface PiProvider {
   models: PiModelEntry[];
   /** Optional cookie forwarded to the upstream. */
   cookie?: string;
+  /** Thinking-replay padding mode (default "auto"). */
+  thinkingPadding?: ThinkingPadMode;
 }
 
 export interface PiConfig {
@@ -126,8 +132,16 @@ export function loadPiConfig(): PiConfig {
           apiKey?: string;
           models?: PiModelEntry[];
           cookie?: string;
+          thinkingPadding?: string;
         };
         if (!provider.baseUrl || !provider.api) continue;
+
+        const thinkingPadding =
+          provider.thinkingPadding === "always" ||
+          provider.thinkingPadding === "auto" ||
+          provider.thinkingPadding === "never"
+            ? (provider.thinkingPadding as ThinkingPadMode)
+            : undefined;
 
         const apiKeyRaw = provider.apiKey || "";
         const apiKey = resolveApiKey(apiKeyRaw);
@@ -144,6 +158,7 @@ export function loadPiConfig(): PiConfig {
           apiKeyRaw,
           models: Array.isArray(provider.models) ? provider.models : [],
           cookie,
+          ...(thinkingPadding ? { thinkingPadding } : {}),
         });
       }
     }
@@ -225,4 +240,12 @@ export function getAllModels(): Array<{
     }
   }
   return Array.from(map.values());
+}
+
+/** Look up a provider's declared `thinking` flag for a model id. */
+export function declaredModelThinking(
+  provider: PiProvider,
+  modelId: string,
+): boolean | undefined {
+  return provider.models.find((m) => m.id === modelId)?.thinking;
 }

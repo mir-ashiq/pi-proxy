@@ -30,6 +30,7 @@ import {
   type PiProvider,
   type WireFormat,
   apiFormatToWireFormat,
+  declaredModelThinking,
   findProviderForModel,
   loadPiConfig,
   maskApiKey,
@@ -39,14 +40,36 @@ import {
   convertRequestBody,
   convertResponseBody,
   convertStreamResponse,
+  reconstructAnthropicResponseFromSSE,
+  reconstructOpenAIResponseFromSSE,
 } from "@/lib/format-converter";
+import {
+  GLOBAL_PAD_MODE,
+  type ThinkingPadMode,
+  markModelProducesThinking,
+  modelProducesThinking,
+  observeThinkingInResponse,
+  padAnthropicThinking,
+  padOpenAIReasoning,
+} from "@/lib/thinking";
 import { platform as osPlatform, release as osRelease, arch as osArch } from "node:os";
 
-export const PI_PROXY_VERSION = "2.0.0";
+export const PI_PROXY_VERSION = "2.1.0";
 
 /** Demo mode: when true, return simulated responses without hitting upstreams. */
 export const DEMO_MODE =
   process.env.PI_DEMO_MODE === "1" || process.env.PI_DEMO_MODE === "true";
+
+/**
+ * Hard cap for streaming upstream fetches (ms). Streaming requests used to
+ * carry no timeout at all, so a hung upstream pinned the connection forever.
+ * Generous by default: legitimate clients (LEGION bounds attempts at 240s)
+ * abort long before this fires; only zombies are reaped.
+ */
+const STREAM_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.PI_STREAM_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 600_000;
+})();
 
 /** Returns true if the request should be served in demo mode. */
 export function shouldUseDemo(req: Request): boolean {
@@ -167,6 +190,9 @@ function buildUpstreamHeaders(
   h.delete("x-pi-demo");
   h.delete("host");
   h.delete("content-length"); // fetch will recompute this
+  // The client's cookie jar has no business upstream unless the provider
+  // explicitly configures one (below).
+  h.delete("cookie");
 
   // Set the provider's auth header based on the upstream's wire format.
   if (format === "anthropic") {
@@ -255,6 +281,91 @@ export interface RouteResult {
   conversion: "none" | "openai→anthropic" | "anthropic→openai";
 }
 
+/** Resolve the effective thinking-pad mode for a provider+model request. */
+function effectivePadMode(provider: PiProvider, model: string): ThinkingPadMode {
+  if (GLOBAL_PAD_MODE) return GLOBAL_PAD_MODE;
+  if (provider.thinkingPadding) return provider.thinkingPadding;
+  const declared = declaredModelThinking(provider, model);
+  if (declared === true) return "always";
+  if (declared === false) return "never";
+  return "auto";
+}
+
+/**
+ * Apply thinking-replay padding to the provider-format request body.
+ *
+ * Strict thinking-mode channels (z.ai GLM behind relays) reject assistant
+ * history that lacks reasoning. After format conversion the body speaks the
+ * provider's wire format, so we pad in whatever shape that format expresses
+ * reasoning: message-level reasoning fields for OpenAI upstreams, leading
+ * thinking content blocks for Anthropic upstreams.
+ */
+function applyThinkingPadding(
+  body: unknown,
+  provider: PiProvider,
+  providerFormat: WireFormat,
+  model: string,
+): { body: unknown; padded: number; mode: string } {
+  const mode = effectivePadMode(provider, model);
+  if (mode === "never") return { body, padded: 0, mode: "off" };
+  const force =
+    mode === "always" ||
+    (mode === "auto" && modelProducesThinking(provider.name, model));
+  const result =
+    providerFormat === "anthropic"
+      ? padAnthropicThinking(body, force)
+      : padOpenAIReasoning(body, force);
+  return { body: result.body, padded: result.padded, mode: result.mode };
+}
+
+/**
+ * Passthrough stream observer: tee the upstream body, serve one branch to
+ * the client untouched, and scan the other for reasoning markers so the
+ * proxy can learn which models produce thinking content (which in turn
+ * drives request padding on later turns). Best-effort by design.
+ */
+function observePassthroughStream(
+  upstream: Response,
+  provider: PiProvider,
+  model: string,
+): Response {
+  if (!upstream.body) return upstream;
+  const [clientBranch, scanBranch] = upstream.body.tee();
+  (async () => {
+    const reader = scanBranch.getReader();
+    const decoder = new TextDecoder();
+    let seen = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (seen.length < 2_000_000) seen += decoder.decode(value, { stream: true });
+        if (
+          seen.includes('"reasoning_content"') ||
+          seen.includes('"reasoning"') ||
+          seen.includes('"thinking"') ||
+          seen.includes("thinking_delta")
+        ) {
+          markModelProducesThinking(provider.name, model);
+          break;
+        }
+      }
+    } catch {
+      // Observation must never break forwarding.
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // already closed
+      }
+    }
+  })();
+  return new Response(clientBranch, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
+}
+
 /**
  * Route and forward a request to the matching upstream provider.
  *
@@ -319,7 +430,13 @@ export async function routeAndForward(
   const stream = isStreamRequest(body);
 
   // Convert request body if needed.
-  const upstreamBody = convertRequestBody(body, conversion);
+  let upstreamBody = convertRequestBody(body, conversion);
+
+  // Thinking-replay padding: strict thinking-mode channels demand every
+  // replayed assistant turn to carry reasoning; pad thinking-less turns in
+  // the shape the upstream's wire format expresses it.
+  const pad = applyThinkingPadding(upstreamBody, provider, providerFormat, model);
+  upstreamBody = pad.body;
 
   // Parse the client's URL to forward query params (e.g. ?beta=true).
   const clientUrl = (() => {
@@ -343,7 +460,10 @@ export async function routeAndForward(
       method: "POST",
       headers,
       body: JSON.stringify(upstreamBody),
-      signal: stream ? undefined : AbortSignal.timeout(120_000),
+      // Bound every attempt: non-streaming at 120s, streaming at
+      // PI_STREAM_TIMEOUT_MS (default 10 min) — a hung upstream used to
+      // pin streaming connections forever.
+      signal: AbortSignal.timeout(stream ? STREAM_TIMEOUT_MS : 120_000),
     });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -597,6 +717,8 @@ export async function routeAndForward(
       const jsonText = await upstream.text();
       try {
         const jsonBody = JSON.parse(jsonText);
+        // Learn thinking models from the response before converting.
+        observeThinkingInResponse(jsonBody, providerFormat, provider.name, model);
         const convertedBody = convertResponseBody(jsonBody, conversion);
         // Emit as a single SSE chunk + [DONE].
         const sseBody = `data: ${JSON.stringify(convertedBody)}\n\ndata: [DONE]\n\n`;
@@ -620,8 +742,28 @@ export async function routeAndForward(
         // (which will likely also fail, but at least we tried).
       }
     }
-    // Streaming: wrap the upstream body with a format-converting TransformStream.
-    const converted = convertStreamResponse(upstream, conversion, model);
+    // Streaming: convert the SSE format when needed, and observe
+    // reasoning markers along the way so the proxy learns which models
+    // produce thinking content (drives request padding on later turns).
+    let converted: Response;
+    if (conversion === "none") {
+      converted = observePassthroughStream(upstream, provider, model);
+    } else {
+      converted = convertStreamResponse(upstream, conversion, model, {
+        onThinking: () => markModelProducesThinking(provider.name, model),
+      });
+    }
+    try {
+      converted.headers.set("X-Pi-Proxy", PI_PROXY_VERSION);
+      converted.headers.set("X-Pi-Proxy-Provider", provider.name);
+      converted.headers.set("X-Pi-Proxy-Conversion", conversion);
+      converted.headers.set(
+        "X-Pi-Proxy-Think-Pad",
+        `${pad.mode};padded=${pad.padded}`,
+      );
+    } catch {
+      // Headers immutable on this response — observability only, skip.
+    }
     return { response: converted, conversion, provider };
   }
 
@@ -629,57 +771,47 @@ export async function routeAndForward(
   const text = await upstream.text();
 
   // EDGE CASE: some upstreams return SSE-formatted responses even when
-  // the client requested stream:false. If we detect SSE framing, extract
-  // the JSON payload from the data: lines so we can parse it as a normal
-  // JSON response.
+  // the client requested stream:false. Reconstruct a full response object
+  // from the SSE framing (merging chunk deltas — the old code kept only
+  // the first data line and silently lost the rest of the content).
   const upstreamCt = upstream.headers.get("content-type") || "";
-  let textToParse = text;
+  let parsed: unknown;
   if (
     upstreamCt.includes("text/event-stream") ||
     text.trim().startsWith("data:")
   ) {
-    // Collect all data: lines (excluding [DONE]) and concatenate.
-    const dataLines = text
-      .split("\n")
-      .filter((l) => l.trim().startsWith("data:"))
-      .map((l) => l.replace(/^\s*data:\s*/, "").trim())
-      .filter((l) => l && l !== "[DONE]");
-    if (dataLines.length > 0) {
-      // If there are multiple chunks, try to reconstruct the full
-      // response by concatenating the content. This is a best-effort
-      // fallback for misbehaving upstreams.
-      if (dataLines.length === 1) {
-        textToParse = dataLines[0];
-      } else {
-        // Multiple SSE chunks — try parsing the first one as it often
-        // contains the complete response for error cases.
-        textToParse = dataLines[0];
-      }
+    parsed =
+      providerFormat === "openai"
+        ? reconstructOpenAIResponseFromSSE(text)
+        : reconstructAnthropicResponseFromSSE(text);
+  }
+  if (parsed === null || parsed === undefined) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Non-JSON response — surface as error.
+      return {
+        response:
+          clientFormat === "openai"
+            ? openAIError(
+                502,
+                `upstream returned non-JSON body: ${text.slice(0, 200)}`,
+                "upstream_error",
+              )
+            : anthropicError(
+                502,
+                `upstream returned non-JSON body: ${text.slice(0, 200)}`,
+                "upstream_error",
+              ),
+        conversion: "none",
+        provider,
+      };
     }
   }
 
-  let parsed: unknown = textToParse;
-  try {
-    parsed = JSON.parse(textToParse);
-  } catch {
-    // Non-JSON response — surface as error.
-    return {
-      response:
-        clientFormat === "openai"
-          ? openAIError(
-              502,
-              `upstream returned non-JSON body: ${text.slice(0, 200)}`,
-              "upstream_error",
-            )
-          : anthropicError(
-              502,
-              `upstream returned non-JSON body: ${text.slice(0, 200)}`,
-              "upstream_error",
-            ),
-      conversion: "none",
-      provider,
-    };
-  }
+  // Learn thinking models from the response.
+  observeThinkingInResponse(parsed, providerFormat, provider.name, model);
+
   const convertedBody = convertResponseBody(parsed, conversion);
   return {
     response: new Response(JSON.stringify(convertedBody), {
@@ -689,6 +821,7 @@ export async function routeAndForward(
         "X-Pi-Proxy": PI_PROXY_VERSION,
         "X-Pi-Proxy-Provider": provider.name,
         "X-Pi-Proxy-Conversion": conversion,
+        "X-Pi-Proxy-Think-Pad": `${pad.mode};padded=${pad.padded}`,
       },
     }),
     conversion,

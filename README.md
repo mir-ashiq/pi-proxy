@@ -142,9 +142,64 @@ When a request arrives with `model: "X"`:
 4. The request is forwarded to that provider's `baseUrl` with that provider's resolved `apiKey`.
 
 Format conversions supported:
-- **Request body**: OpenAI system messages → Anthropic `system` field (and back)
-- **Non-streaming response**: `choices[0].message.content` ↔ `content[].text`
-- **Streaming SSE**: `data: {choices:[{delta:{content}}]}` ↔ `event: content_block_delta`
+- **Request body**: OpenAI system messages → Anthropic `system` field (and back),
+  `reasoning_content`/`reasoning`/`reasoning_text` ↔ `thinking` content blocks,
+  `tools`/`tool_calls`/`role:"tool"` ↔ `tools`/`tool_use`/`tool_result`,
+  `image_url` parts (data: and http URLs) ↔ `image` blocks,
+  `reasoning_effort` → Anthropic `thinking` parameter
+- **Non-streaming response**: `choices[0].message.content` ↔ `content[].text`,
+  `reasoning_content` ↔ `content[].thinking`, `tool_calls` ↔ `tool_use`,
+  finish_reason ↔ stop_reason, usage
+- **Streaming SSE**: `data: {choices:[{delta:{content}}]}` ↔ `event: content_block_delta`,
+  `delta.reasoning_content` ↔ `thinking_delta`, `delta.tool_calls` ↔ `tool_use` +
+  `input_json_delta` (with proper terminal events and usage on both sides)
+
+## Thinking-mode replay padding
+
+Strict thinking-mode channels (z.ai GLM-family upstreams behind relays) reject
+a request whose assistant history lacks reasoning — error text:
+`The content[].thinking in the thinking mode must be passed back to the API`.
+Turns without reasoning appear when the conversation failed over across models
+or when an older proxy/consumer dropped the reasoning. The proxy pads those
+turns automatically, in the shape the upstream wants:
+
+- **OpenAI-format upstreams**: assistant messages missing the conversation's
+  reasoning field (`reasoning_content` / `reasoning` / `reasoning_text`)
+  gain it as an empty string — the shape a thinking-mode upstream itself
+  returns for a turn that produced no reasoning.
+- **Anthropic-format upstreams**: assistant messages that don't open with a
+  `thinking` content block get one prepended (placeholder text, configurable).
+
+The gate is self-limiting: padding only applies when the conversation already
+speaks a reasoning dialect, the model is known to produce reasoning (learned
+from observed responses, in-memory), or the config forces it. Configure per
+provider in `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "AgentRouter-Anthropic": {
+      "baseUrl": "https://agentrouter.org/v1",
+      "api": "anthropic-messages",
+      "apiKey": "$PI_GATEWAY_API_KEY",
+      "thinkingPadding": "always",
+      "models": [
+        { "id": "glm-5.3", "thinking": true },
+        { "id": "claude-opus-5" }
+      ]
+    }
+  }
+}
+```
+
+- `thinkingPadding`: `"auto"` (default) | `"always"` | `"never"` per provider.
+- `thinking`: `true` | `false` per model entry (overrides the provider mode).
+
+**Why an Anthropic-format provider matters for strict channels**: a relay's
+OpenAI ingress generally cannot carry thinking as a content block
+(`unknown variant `thinking``), while its Anthropic `/v1/messages` endpoint
+natively accepts and replays `content[].thinking` blocks. Pointing the
+provider at the Anthropic endpoint lets the proxy convert and pad end-to-end.
 
 ## Environment variables
 
@@ -153,6 +208,9 @@ Format conversions supported:
 | `PI_CONFIG_PATH` | `~/.pi/agent/models.json` | Path to Pi's models.json |
 | `PI_DEMO_MODE` | `0` | When `1`, returns simulated SSE responses without hitting upstreams |
 | `PI_UPSTREAM_COOKIE_<ProviderName>` | (none) | Optional cookie forwarded to a specific provider (for WAF bypass) |
+| `PI_THINKING_PADDING` | (unset) | Global override for thinking-replay padding: `auto` / `always` / `never` |
+| `PI_THINKING_PLACEHOLDER` | `.` | Placeholder text for padded Anthropic thinking blocks |
+| `PI_STREAM_TIMEOUT_MS` | `600000` | Hard cap for streaming upstream fetches (zombie reaping) |
 
 API keys are **not** set via env vars on the proxy directly — they come from the `apiKey` field in each provider's config (which itself can reference `$ENV_VAR`).
 
@@ -164,6 +222,20 @@ For verifying the proxy plumbing without reachable upstreams:
 - Per-request: `x-pi-demo: 1` header
 
 Returns well-formed simulated OpenAI/Anthropic SSE streams.
+
+## Observability
+
+Every proxied response carries `X-Pi-Proxy` headers:
+
+- `X-Pi-Proxy` — proxy version
+- `X-Pi-Proxy-Provider` — provider that served the request
+- `X-Pi-Proxy-Conversion` — `none` / `openai→anthropic` / `anthropic→openai`
+- `X-Pi-Proxy-Think-Pad` — `dialect` / `forced` / `off` plus how many turns
+  were padded (e.g. `dialect;padded=3`)
+
+`GET /api/config` also reports the per-provider padding mode and the learned
+list of thinking-producing models; `GET /api/debug?model=X&format=openai`
+shows exactly how a request would be routed, converted, and padded.
 
 ## Tech stack
 

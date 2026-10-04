@@ -6,6 +6,7 @@ import {
   loadPiConfig,
   maskApiKey,
 } from "@/lib/pi-config";
+import { GLOBAL_PAD_MODE, thinkingModelRegistrySnapshot } from "@/lib/thinking";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,13 +40,21 @@ export async function GET(_req: NextRequest) {
           : "literal",
         models: p.models.map((m) => ({ id: m.id, name: m.name || m.id })),
         has_cookie: Boolean(p.cookie),
+        thinking_padding: p.thinkingPadding ?? "auto",
       })),
       models: models.map((m) => ({
         id: m.id,
         name: m.name,
         providers: m.providers,
-        formats: m.formats,
+        // Derived from the providers list (getAllModels does not return a
+        // `formats` field — v2.0 shipped a bug that read `m.formats`,
+        // which is always undefined).
+        formats: Array.from(new Set(m.providers.map((p) => p.format))),
       })),
+      thinking: {
+        pad_mode_override: GLOBAL_PAD_MODE,
+        learned_thinking_models: thinkingModelRegistrySnapshot(),
+      },
       endpoints: {
         openai: {
           base_url: "/api/v1",
