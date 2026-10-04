@@ -16,6 +16,9 @@
  */
 
 import {
+  convertRequestBody,
+  convertResponseBody,
+  convertStreamResponse,
   anthropicRequestToOpenAI,
   anthropicResponseToOpenAI,
   anthropicStreamToOpenAIStream,
@@ -502,6 +505,115 @@ section("Thinking-model learning");
 
   markModelProducesThinking("P", "m");
   assert(modelProducesThinking("P", "m") && !modelProducesThinking("P", "other"), "registry keyed by provider+model");
+}
+
+section("Dispatcher direction (request vs response travel opposite ways)");
+
+{
+  // conversion names the REQUEST direction (client -> provider).
+  // openai->anthropic = OpenAI client behind an Anthropic provider:
+  // the REQUEST body (client's) converts openai -> anthropic ...
+  const req = convertRequestBody(
+    { model: "m", messages: [{ role: "user", content: "hi" }] },
+    "openai->anthropic",
+  ) as {
+    messages?: Array<{ role?: string; content?: unknown }>;
+  };
+  assert(
+    Array.isArray(req.messages) &&
+      req.messages[0]?.role === "user" &&
+      Array.isArray(req.messages[0]?.content) === true,
+    "request converted to anthropic shape (block-array content)",
+  );
+  // ... and the RESPONSE body (provider's) converts anthropic -> openai.
+  const anthropicBody = {
+    id: "msg_1",
+    type: "message",
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "hmm" },
+      { type: "text", text: "pong" },
+    ],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 3, output_tokens: 2 },
+  };
+  const back = convertResponseBody(anthropicBody, "openai->anthropic") as {
+    object?: string;
+    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
+  };
+  assert(back.object === "chat.completion", "response returned to openai shape (object)");
+  assert(
+    back.choices?.[0]?.message?.content === "pong",
+    "response text survives anthropic->openai return trip",
+  );
+  assert(
+    back.choices?.[0]?.message?.reasoning_content === "hmm",
+    "thinking block returned as reasoning_content",
+  );
+}
+
+{
+  // anthropic->openai = Anthropic client behind an OpenAI provider:
+  // the provider's OPENAI response must come back in ANTHROPIC shape.
+  const openaiBody = {
+    id: "chatcmpl-1",
+    object: "chat.completion",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "pong", reasoning_content: "hmm" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+  };
+  const back = convertResponseBody(openaiBody, "anthropic->openai") as {
+    type?: string;
+    content?: Array<{ type: string }>;
+  };
+  assert(back.type === "message", "response returned to anthropic shape (type)");
+  assert(
+    back.content?.some((b) => b.type === "text") === true &&
+      back.content?.some((b) => b.type === "thinking") === true,
+    "text + thinking blocks present in anthropic return",
+  );
+}
+
+{
+  // Stream dispatcher: openai->anthropic must convert ANTHROPIC SSE into
+  // OPENAI chunks (readable by an OpenAI client).
+  const encoder = new TextEncoder();
+  const events = [
+    "event: message_start\ndata: " +
+      JSON.stringify({
+        type: "message_start",
+        message: { id: "msg_9", model: "m" },
+      }) +
+      "\n\n",
+    "event: content_block_delta\ndata: " +
+      JSON.stringify({
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "hi" },
+      }) +
+      "\n\n",
+    "event: message_stop\ndata: " + JSON.stringify({ type: "message_stop" }) + "\n\n",
+  ];
+  const upstream = new Response(
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const e of events) c.enqueue(encoder.encode(e));
+        c.close();
+      },
+    }),
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+  const converted = convertStreamResponse(upstream, "openai->anthropic", "m");
+  const text = await new Response(converted.body!).text();
+  assert(
+    text.includes('"object":"chat.completion.chunk"'),
+    "anthropic SSE converted to openai chunk stream",
+  );
+  assert(text.includes("[DONE]"), "openai stream carries terminal [DONE]");
 }
 
 section("Finish/stop reason maps");

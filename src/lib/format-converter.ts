@@ -1607,6 +1607,13 @@ export function convertRequestBody(
 
 /**
  * Convert a non-streaming upstream response back to the client's format.
+ *
+ * NOTE the direction: `conversion` names the REQUEST direction
+ * (client -> provider). The RESPONSE travels the opposite way, so
+ * `openai->anthropic` (an OpenAI client behind an Anthropic provider)
+ * converts the provider's ANTHROPIC body back to OpenAI — the v2.1.0
+ * dispatch had this inverted and returned an empty Anthropic shell to
+ * OpenAI clients.
  */
 export function convertResponseBody(
   body: unknown,
@@ -1614,15 +1621,22 @@ export function convertResponseBody(
 ): unknown {
   if (conversion === "none") return body;
   if (conversion === "openai->anthropic") {
-    return openAIResponseToAnthropic(body as OpenAIResponse);
+    // OpenAI client, Anthropic provider: anthropic body -> openai shape.
+    return anthropicResponseToOpenAI(body as AnthropicResponse);
   }
-  return anthropicResponseToOpenAI(body as AnthropicResponse);
+  // Anthropic client, OpenAI provider: openai body -> anthropic shape.
+  return openAIResponseToAnthropic(body as OpenAIResponse);
 }
 
 /**
  * Wrap an upstream streaming response, converting its SSE format back to
  * the client's expected format. For `conversion === "none"`, the response
  * is returned unchanged (byte-for-byte passthrough).
+ *
+ * NOTE the direction: `conversion` names the REQUEST direction
+ * (client -> provider); the upstream stream travels the opposite way,
+ * so `openai->anthropic` (OpenAI client, Anthropic provider) converts
+ * the provider's ANTHROPIC SSE back to OpenAI chunk shape.
  */
 export function convertStreamResponse(
   upstream: Response,
@@ -1632,7 +1646,9 @@ export function convertStreamResponse(
 ): Response {
   if (conversion === "none") return upstream;
   if (conversion === "openai->anthropic") {
-    return openAIStreamToAnthropicStream(upstream, model, options);
+    // OpenAI client, Anthropic provider: anthropic SSE -> openai chunks.
+    return anthropicStreamToOpenAIStream(upstream, model, options);
   }
-  return anthropicStreamToOpenAIStream(upstream, model, options);
+  // Anthropic client, OpenAI provider: openai SSE -> anthropic events.
+  return openAIStreamToAnthropicStream(upstream, model, options);
 }
