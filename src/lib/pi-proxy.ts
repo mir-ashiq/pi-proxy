@@ -55,7 +55,7 @@ import {
 } from "@/lib/thinking";
 import { platform as osPlatform, release as osRelease, arch as osArch } from "node:os";
 
-export const PI_PROXY_VERSION = "2.1.1";
+export const PI_PROXY_VERSION = "2.1.2";
 
 /** Demo mode: when true, return simulated responses without hitting upstreams. */
 export const DEMO_MODE =
